@@ -9,6 +9,8 @@ Run on the comma device (no extra dependencies, plain Python 3.9+):
   python3 /data/fw_autopatch.py            # dry run: show what would be added
   python3 /data/fw_autopatch.py --apply    # patch fingerprints.py, then: sudo reboot
   python3 /data/fw_autopatch.py --revert   # restore the original file(s)
+  python3 /data/fw_autopatch.py --reapply  # boot hook: re-add only versions you
+                                           # approved earlier with --apply
 
 Both copies of openpilot are handled:
   * live:   /data/openpilot (what is running now)
@@ -51,6 +53,23 @@ VERSION_RE = re.compile(
   r"^(?P<base>.+) \((?P<build>\d+)\),(?P<family>[A-Za-z]+\d+)\.(?P<rest>[0-9][0-9.]*)$"
 )
 MARKER = "fw_autopatch"
+APPROVED_FILE = "/data/fw_autopatch_approved.txt"
+
+
+def load_approved():
+  if not os.path.exists(APPROVED_FILE):
+    return set()
+  with open(APPROVED_FILE, "rb") as f:
+    return {line.strip() for line in f if line.strip()}
+
+
+def save_approved(versions):
+  approved = load_approved() | set(versions)
+  tmp = APPROVED_FILE + ".tmp"
+  with open(tmp, "wb") as f:
+    for v in sorted(approved):
+      f.write(v + b"\n")
+  os.replace(tmp, APPROVED_FILE)
 
 
 def find_fingerprints():
@@ -207,15 +226,23 @@ def revert(label, path):
   print(f"[{label}] git checkout failed, restored oldest backup {backups[0]}")
 
 
-def process(label, path, blob, apply):
-  """Plan (and optionally apply) the patch for one fingerprints.py. Returns #additions."""
+def process(label, path, apply, blob=None, approved=None, quiet=False):
+  """Plan (and optionally apply) the patch for one fingerprints.py.
+  Versions come from the CarParams blob, or from the approved list (--reapply).
+  Returns (#additions, set of matched versions)."""
   with open(path) as f:
     src = f.read()
   entries = parse_entries(src)
   fam_map = build_family_map(entries)
-  found, unknown = observed_versions(blob, fam_map)
+  if blob is not None:
+    found, unknown = observed_versions(blob, fam_map)
+  else:
+    found = {v: family_of(v) for v in approved if family_of(v) in fam_map}
+    unknown = []
   additions, skipped = plan(entries, fam_map, found)
 
+  if quiet and not additions and not skipped:
+    return 0, set(found)
   print(f"\n[{label}] {path}")
   for version, reason in skipped:
     print(f"  SKIP   {version.decode()}  ({reason})")
@@ -223,13 +250,13 @@ def process(label, path, blob, apply):
     print(f"  REVIEW {run.decode(errors='replace')}  (no known family - check manually)")
   if not additions:
     print("  nothing to add")
-    return 0
+    return 0, set(found)
   for idx, version in additions:
     e = entries[idx]
     print(f"  ADD    {version.decode()}  ->  {e['car']} / {e['ecu']}")
   if apply:
     apply_patch(label, path, src, entries, additions)
-  return len(additions)
+  return len(additions), set(found)
 
 
 def main():
@@ -237,9 +264,26 @@ def main():
   ap.add_argument("--apply", action="store_true", help="write the changes")
   ap.add_argument("--force", action="store_true", help="run even if the car was recognized")
   ap.add_argument("--revert", action="store_true", help="restore the original fingerprints.py file(s)")
+  ap.add_argument("--reapply", action="store_true",
+                  help="re-add previously approved versions if an openpilot update removed them "
+                       "(for the boot hook; never adds new versions)")
   args = ap.parse_args()
 
   paths = find_fingerprints()
+
+  if args.reapply:
+    approved = load_approved()
+    if not approved:
+      return
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    total = 0
+    for label, path in paths.items():
+      n, _ = process(label, path, apply=True, approved=approved, quiet=True)
+      total += n
+    if total:
+      print(f"{stamp} reapplied {total} approved version(s)")
+    return
+
   if "staged" in paths:
     print("Note: a downloaded openpilot update is waiting in /data/safe_staging/finalized "
           "and will replace the live copy on the next reboot. Both copies are handled.")
@@ -257,9 +301,15 @@ def main():
     print("Car was recognized, nothing to do. Use --force to check anyway.")
     return
 
-  total = 0
+  total, matched = 0, set()
   for label, path in paths.items():
-    total += process(label, path, blob, args.apply)
+    n, found = process(label, path, args.apply, blob=blob)
+    total += n
+    matched |= found
+
+  if args.apply and matched:
+    save_approved(matched)
+    print(f"Approved versions saved to {APPROVED_FILE} (used by --reapply)")
 
   if total == 0:
     print("\nNo new versions of known families found.")
