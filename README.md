@@ -81,6 +81,14 @@ Dry run. Run again with --apply to write, then: sudo reboot
 Added lines are marked with a `# fw_autopatch <date>` comment. Backups are kept
 in `/data/fw_autopatch_backups/`.
 
+### Pending updates
+
+openpilot downloads updates in the background into
+`/data/safe_staging/finalized` and swaps them in on the next reboot, even when
+the version number stays the same. Patching only `/data/openpilot` would then be
+lost on reboot. The script therefore patches **both** the live copy and a
+waiting staged copy if one exists, and tells you when it found one.
+
 ## Please report your firmware upstream
 
 This script is a stopgap. If it found a new version for your car, check whether
