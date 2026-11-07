@@ -89,6 +89,27 @@ the version number stays the same. Patching only `/data/openpilot` would then be
 lost on reboot. The script therefore patches **both** the live copy and a
 waiting staged copy if one exists, and tells you when it found one.
 
+### Optional: boot hook against surprise overwrites
+
+Every `--apply` records the versions you approved in
+`/data/fw_autopatch_approved.txt`. `--reapply` re-adds only those versions to
+the live and staged copy if an openpilot update removed them. It **never** adds
+a version you haven't approved; a new Tesla firmware still needs a manual
+`--apply`.
+
+Run it once per boot, right before openpilot starts, by adding one line to
+`/data/continue.sh` above the `exec` line (back the file up first):
+
+```bash
+cp /data/continue.sh /data/continue.sh.bak
+sed -i '/^exec /i timeout 20 python3 /data/fw_autopatch.py --reapply >> /data/fw_autopatch.log 2>&1 || true' /data/continue.sh
+cat /data/continue.sh
+```
+
+It runs for a fraction of a second at boot, no daemon. `timeout` and `|| true`
+make sure openpilot always starts, even if the script fails. A full reflash
+recreates `continue.sh`, so the hook has to be added again afterwards.
+
 ## Please report your firmware upstream
 
 This script is a stopgap. If it found a new version for your car, check whether
