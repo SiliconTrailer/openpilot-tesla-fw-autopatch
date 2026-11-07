@@ -8,7 +8,13 @@ Run on the comma device (no extra dependencies, plain Python 3.9+):
 
   python3 /data/fw_autopatch.py            # dry run: show what would be added
   python3 /data/fw_autopatch.py --apply    # patch fingerprints.py, then: sudo reboot
-  python3 /data/fw_autopatch.py --revert   # restore the original file
+  python3 /data/fw_autopatch.py --revert   # restore the original file(s)
+
+Both copies of openpilot are handled:
+  * live:   /data/openpilot (what is running now)
+  * staged: /data/safe_staging/finalized (an update openpilot has already
+            downloaded; it replaces the live copy on the next reboot, so a
+            patch to the live copy alone would be lost)
 
 Safety gates:
   * only acts if the last fingerprint was MOCK (override with --force)
@@ -32,10 +38,14 @@ import sys
 PARAMS_DIR = "/data/params/d"
 PARAM_FILES = ["CarParams", "CarParamsPersistent", "CarParamsPrevRoute"]
 BACKUP_DIR = "/data/fw_autopatch_backups"
-FINGERPRINT_GLOBS = [
-  "/data/openpilot/opendbc_repo/opendbc/car/tesla/fingerprints.py",
-  "/data/openpilot/opendbc/car/tesla/fingerprints.py",
-  "/data/openpilot/**/car/tesla/fingerprints.py",
+INSTALL_ROOTS = {
+  "live": "/data/openpilot",
+  "staged": "/data/safe_staging/finalized",
+}
+FINGERPRINT_SUBPATHS = [
+  "opendbc_repo/opendbc/car/tesla/fingerprints.py",
+  "opendbc/car/tesla/fingerprints.py",
+  "**/car/tesla/fingerprints.py",
 ]
 VERSION_RE = re.compile(
   r"^(?P<base>.+) \((?P<build>\d+)\),(?P<family>[A-Za-z]+\d+)\.(?P<rest>[0-9][0-9.]*)$"
@@ -43,12 +53,20 @@ VERSION_RE = re.compile(
 MARKER = "fw_autopatch"
 
 
-def find_fingerprints() -> str:
-  for pattern in FINGERPRINT_GLOBS:
-    hits = glob.glob(pattern, recursive=True)
-    if hits:
-      return hits[0]
-  sys.exit("fingerprints.py not found under /data/openpilot")
+def find_fingerprints():
+  """Return {label: path} for every openpilot copy that has a Tesla fingerprints.py."""
+  found = {}
+  for label, root in INSTALL_ROOTS.items():
+    if not os.path.isdir(root):
+      continue
+    for sub in FINGERPRINT_SUBPATHS:
+      hits = glob.glob(os.path.join(root, sub), recursive=True)
+      if hits:
+        found[label] = hits[0]
+        break
+  if "live" not in found:
+    sys.exit("fingerprints.py not found under /data/openpilot")
+  return found
 
 
 def read_param_blob():
@@ -97,7 +115,7 @@ def family_of(version: bytes):
 
 
 def build_family_map(entries):
-  """(base, family) -> list of entry indices that contain that family."""
+  """(base, family) -> set of entry indices that contain that family."""
   fam_map = {}
   for idx, entry in enumerate(entries):
     for v in entry["versions"]:
@@ -140,10 +158,10 @@ def plan(entries, fam_map, found):
   return additions, skipped
 
 
-def apply_patch(path, src, entries, additions):
+def apply_patch(label, path, src, entries, additions):
   os.makedirs(BACKUP_DIR, exist_ok=True)
   stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-  backup = os.path.join(BACKUP_DIR, f"fingerprints.py.{stamp}")
+  backup = os.path.join(BACKUP_DIR, f"fingerprints.py.{label}.{stamp}")
   shutil.copy2(path, backup)
 
   lines = src.splitlines(keepends=True)
@@ -164,42 +182,72 @@ def apply_patch(path, src, entries, additions):
   for idx, version in additions:
     car, ecu = entries[idx]["car"], entries[idx]["ecu"]
     if not any(e["car"] == car and e["ecu"] == ecu and version in e["versions"] for e in new_entries):
-      sys.exit(f"Verification failed for {version!r}, nothing written. Backup: {backup}")
+      sys.exit(f"[{label}] verification failed for {version!r}, nothing written. Backup: {backup}")
 
   tmp = path + ".tmp"
   with open(tmp, "w") as f:
     f.write(new_src)
+  shutil.copymode(path, tmp)
   os.replace(tmp, path)
-  print(f"Backup: {backup}")
+  print(f"[{label}] patched, backup: {backup}")
 
 
-def revert(path):
+def revert(label, path):
   directory, name = os.path.split(path)
   result = subprocess.run(["git", "-C", directory, "checkout", "--", name],
                           capture_output=True, text=True)
   if result.returncode == 0:
-    print("Restored fingerprints.py from git.")
+    print(f"[{label}] restored from git")
     return
-  backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "fingerprints.py.*")))
+  backups = sorted(glob.glob(os.path.join(BACKUP_DIR, f"fingerprints.py.{label}.*")))
   if not backups:
-    sys.exit(f"git checkout failed ({result.stderr.strip()}) and no backup found.")
+    print(f"[{label}] git checkout failed ({result.stderr.strip()}) and no backup found")
+    return
   shutil.copy2(backups[0], path)  # oldest backup = state before the first patch
-  print(f"git checkout failed, restored oldest backup {backups[0]}")
+  print(f"[{label}] git checkout failed, restored oldest backup {backups[0]}")
+
+
+def process(label, path, blob, apply):
+  """Plan (and optionally apply) the patch for one fingerprints.py. Returns #additions."""
+  with open(path) as f:
+    src = f.read()
+  entries = parse_entries(src)
+  fam_map = build_family_map(entries)
+  found, unknown = observed_versions(blob, fam_map)
+  additions, skipped = plan(entries, fam_map, found)
+
+  print(f"\n[{label}] {path}")
+  for version, reason in skipped:
+    print(f"  SKIP   {version.decode()}  ({reason})")
+  for run in unknown:
+    print(f"  REVIEW {run.decode(errors='replace')}  (no known family - check manually)")
+  if not additions:
+    print("  nothing to add")
+    return 0
+  for idx, version in additions:
+    e = entries[idx]
+    print(f"  ADD    {version.decode()}  ->  {e['car']} / {e['ecu']}")
+  if apply:
+    apply_patch(label, path, src, entries, additions)
+  return len(additions)
 
 
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument("--apply", action="store_true", help="write the changes")
   ap.add_argument("--force", action="store_true", help="run even if the car was recognized")
-  ap.add_argument("--revert", action="store_true", help="restore the original fingerprints.py")
+  ap.add_argument("--revert", action="store_true", help="restore the original fingerprints.py file(s)")
   args = ap.parse_args()
 
-  path = find_fingerprints()
-  print(f"fingerprints.py: {path}")
+  paths = find_fingerprints()
+  if "staged" in paths:
+    print("Note: a downloaded openpilot update is waiting in /data/safe_staging/finalized "
+          "and will replace the live copy on the next reboot. Both copies are handled.")
 
   if args.revert:
-    revert(path)
-    print("Done. Reboot the comma: sudo reboot")
+    for label, path in paths.items():
+      revert(label, path)
+    print("\nDone. Reboot the comma: sudo reboot")
     return
 
   param_name, blob = read_param_blob()
@@ -209,31 +257,16 @@ def main():
     print("Car was recognized, nothing to do. Use --force to check anyway.")
     return
 
-  with open(path) as f:
-    src = f.read()
-  entries = parse_entries(src)
-  fam_map = build_family_map(entries)
-  found, unknown = observed_versions(blob, fam_map)
-  additions, skipped = plan(entries, fam_map, found)
+  total = 0
+  for label, path in paths.items():
+    total += process(label, path, blob, args.apply)
 
-  for version, reason in skipped:
-    print(f"SKIP   {version.decode()}  ({reason})")
-  for run in unknown:
-    print(f"REVIEW {run.decode(errors='replace')}  (no known family - check manually)")
-  if not additions:
-    print("No new versions of known families found.")
-    return
-
-  for idx, version in additions:
-    e = entries[idx]
-    print(f"ADD    {version.decode()}  ->  {e['car']} / {e['ecu']}")
-
-  if not args.apply:
+  if total == 0:
+    print("\nNo new versions of known families found.")
+  elif not args.apply:
     print("\nDry run. Run again with --apply to write, then: sudo reboot")
-    return
-
-  apply_patch(path, src, entries, additions)
-  print("Patched. Reboot the comma with the car awake: sudo reboot")
+  else:
+    print("\nDone. Reboot the comma with the car awake: sudo reboot")
 
 
 if __name__ == "__main__":
