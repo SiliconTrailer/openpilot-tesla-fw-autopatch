@@ -49,66 +49,93 @@ hands ready to take over, as always with openpilot.
 
 No extra Python packages are needed.
 
-## Usage
+## Quick start
 
-Copy the script to `/data` (this partition survives openpilot and AGNOS updates,
-but not a full reflash or reset):
+Copy the script to the device and install it:
 
 ```bash
-scp fw_autopatch.py comma@<device-ip>:/data/
+scp fw_autopatch.py comma@<device-ip>:/tmp/
 ssh comma@<device-ip>
+python3 /tmp/fw_autopatch.py --install   # copies itself to /data, adds the boot hook
 ```
 
-Then:
+When the car shows **Car Unrecognized** after a Tesla update:
 
 ```bash
-python3 /data/fw_autopatch.py            # dry run: show what would be added
-python3 /data/fw_autopatch.py --apply    # patch fingerprints.py
-sudo reboot                              # reboot with the car awake
-python3 /data/fw_autopatch.py --revert   # restore the original file
+python3 /data/fw_autopatch.py            # dry run: shows what it would add
+python3 /data/fw_autopatch.py --apply    # patch and approve the new version
+sudo reboot                              # with the car awake
 ```
 
-Example dry run:
+That's it. The boot hook keeps the approved versions in place across openpilot
+updates until an official release contains them.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| *(none)* | Dry run if the car is unrecognized, status overview if it is recognized |
+| `--apply` | Patch `fingerprints.py` (live and staged copy) and approve the versions |
+| `--force` | With `--apply` or the dry run: check even if the car is recognized |
+| `--status` | Last fingerprint, boot hook, approved versions, patch state per copy |
+| `--install` | Copy the script to `/data/fw_autopatch.py` and add the boot hook to `/data/continue.sh` |
+| `--uninstall` | Remove the boot hook |
+| `--revert` | Restore `fingerprints.py` from git and forget all approvals |
+| `--reapply` | Used by the boot hook: re-add approved versions only |
+
+Already patched by hand? Run `--apply --force` once so the version gets
+approved for the boot hook.
+
+## Example output
+
+Dry run after a Tesla update:
 
 ```
-fingerprints.py: /data/openpilot/opendbc_repo/opendbc/car/tesla/fingerprints.py
-Using CarParamsPersistent: last fingerprint MOCK (unrecognized)
-ADD    TeM3_E014p10_0.0.0 (35),E014.21.2  ->  CAR.TESLA_MODEL_3 / (Ecu.eps, 0x730, None)
+Last fingerprint: MOCK  (CarParamsPersistent)
 
-Dry run. Run again with --apply to write, then: sudo reboot
+[live] /data/openpilot/opendbc_repo/opendbc/car/tesla/fingerprints.py
+  OK      EL014.20.2     already listed
+  NEW     TeM3_E014p10_0.0.0 (35),E014.21.2
+          newer firmware, latest known was E014.20.2
+          -> CAR.TESLA_MODEL_3 / (Ecu.eps, 0x730, None)
+
+Dry run, nothing written. Run with --apply, then: sudo reboot
 ```
 
+Status when everything is fine:
+
+```
+Last fingerprint: TESLA_MODEL_3  (CarParamsPersistent)
+Boot hook:        installed in /data/continue.sh
+Approved:         E014.21.2
+live copy:        patched
+staged copy:      missing E014.21.2 -> boot hook re-adds it on next start
+                  staged = same commit as live: the updater re-stages a clean copy
+                  while git sees the live copy as modified (expected, harmless)
+Last hook action: 2026-11-08T08:12:03 [staged] re-added TeM3_E014p10_0.0.0 (35),E014.21.2 -> ...
+```
+
+Firmware strings of an unknown family show up as `REVIEW` and are never added.
 Added lines are marked with a `# fw_autopatch <date>` comment. Backups are kept
-in `/data/fw_autopatch_backups/`.
+in `/data/fw_autopatch_backups/` (the oldest plus the last five per copy).
 
-### Pending updates
+## Why a boot hook is needed
 
-openpilot downloads updates in the background into
-`/data/safe_staging/finalized` and swaps them in on the next reboot, even when
-the version number stays the same. Patching only `/data/openpilot` would then be
-lost on reboot. The script therefore patches **both** the live copy and a
-waiting staged copy if one exists, and tells you when it found one.
+openpilot keeps a second copy in `/data/safe_staging/finalized`, prepared by its
+updater, and swaps it in for `/data/openpilot` on the next start. As soon as the
+live `fingerprints.py` is patched, git sees it as modified and the updater
+re-stages a **clean copy of the same commit**, without the patch. Patching only
+the live copy is therefore lost on the next reboot.
 
-### Optional: boot hook against surprise overwrites
+The boot hook runs `--reapply` from `/data/continue.sh`, right before
+`launch_openpilot.sh`, which is where the staged copy gets swapped in. So both
+copies are patched before openpilot starts, on every boot. It only re-adds
+versions you approved with `--apply`; a new Tesla firmware always needs your
+`--apply`. It runs for a fraction of a second, no daemon. `timeout` and
+`|| true` make sure openpilot always starts, even if the script fails.
 
-Every `--apply` records the versions you approved in
-`/data/fw_autopatch_approved.txt`. `--reapply` re-adds only those versions to
-the live and staged copy if an openpilot update removed them. It **never** adds
-a version you haven't approved; a new Tesla firmware still needs a manual
-`--apply`.
-
-Run it once per boot, right before openpilot starts, by adding one line to
-`/data/continue.sh` above the `exec` line (back the file up first):
-
-```bash
-cp /data/continue.sh /data/continue.sh.bak
-sed -i '/^exec /i timeout 20 python3 /data/fw_autopatch.py --reapply >> /data/fw_autopatch.log 2>&1 || true' /data/continue.sh
-cat /data/continue.sh
-```
-
-It runs for a fraction of a second at boot, no daemon. `timeout` and `|| true`
-make sure openpilot always starts, even if the script fails. A full reflash
-recreates `continue.sh`, so the hook has to be added again afterwards.
+`/data` survives openpilot and AGNOS updates, but a full reflash or reset wipes
+it and recreates `continue.sh`. Run `--install` again afterwards.
 
 ## Please report your firmware upstream
 
